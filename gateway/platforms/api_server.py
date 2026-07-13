@@ -1516,6 +1516,9 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            # The authenticated API session key is also the stable caller
+            # identity consumed by multi-user memory providers such as Honcho.
+            user_id=gateway_session_key,
         )
         return agent
 
