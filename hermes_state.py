@@ -1010,7 +1010,9 @@ class SessionDB:
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        # Resolve the active profile at construction time.  Tests and profile
+        # subprocesses may set HERMES_HOME after this module was imported.
+        self.db_path = db_path or (get_hermes_home() / "state.db")
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -2956,6 +2958,7 @@ class SessionDB:
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
+                self._remove_project_session_assignments(ids)
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
@@ -5976,6 +5979,20 @@ class SessionDB:
         except OSError:
             pass
 
+    def _remove_project_session_assignments(self, session_ids: List[str]) -> None:
+        """Remove project links before deleting sessions from the separate DB."""
+        projects_path = Path(self.db_path).parent / "projects.db"
+        if not projects_path.exists():
+            return
+
+        from hermes_cli import projects_db as pdb
+        from hermes_cli.sqlite_util import write_txn
+
+        with pdb.connect_closing(db_path=projects_path) as conn:
+            with write_txn(conn):
+                for session_id in session_ids:
+                    pdb.unassign_session(conn, session_id)
+
     def delete_session(
         self,
         session_id: str,
@@ -5999,6 +6016,8 @@ class SessionDB:
             )
             if cursor.fetchone()[0] == 0:
                 return False
+            delegate_ids = _collect_delegate_child_ids(conn, [session_id])
+            self._remove_project_session_assignments([session_id, *delegate_ids])
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -6037,6 +6056,24 @@ class SessionDB:
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
+            candidate = conn.execute(
+                """
+                SELECT id FROM sessions
+                WHERE id = ?
+                  AND title IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions child
+                      WHERE child.parent_session_id = sessions.id
+                  )
+                """,
+                (session_id,),
+            ).fetchone()
+            if candidate is None:
+                return False
+            self._remove_project_session_assignments([session_id])
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
@@ -6113,6 +6150,8 @@ class SessionDB:
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
+            delegate_ids = _collect_delegate_child_ids(conn, existing)
+            self._remove_project_session_assignments([*existing, *delegate_ids])
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
@@ -6210,6 +6249,7 @@ class SessionDB:
             if not session_ids:
                 return 0
 
+            self._remove_project_session_assignments(list(session_ids))
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
@@ -6461,6 +6501,7 @@ class SessionDB:
             if not session_ids:
                 return 0
 
+            self._remove_project_session_assignments(list(session_ids))
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(

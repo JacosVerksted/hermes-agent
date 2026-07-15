@@ -73,6 +73,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from hermes_cli.sqlite_util import write_txn
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -1833,6 +1834,16 @@ class APIServerAdapter(BasePlatformAdapter):
         return None
 
     @staticmethod
+    def _project_sync_dict(project) -> Dict[str, Any]:
+        """Serialize only portable project metadata; never expose server paths."""
+        return {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "pinned": bool(project.pinned),
+        }
+
+    @staticmethod
     def _project_snapshot(conn) -> Dict[str, Any]:
         from hermes_cli import projects_db as pdb
 
@@ -1840,8 +1851,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "hermes.project.snapshot",
             "revision": pdb.get_sync_revision(conn),
             "projects": [
-                project.to_dict()
-                for project in pdb.list_projects(conn, include_archived=True)
+                APIServerAdapter._project_sync_dict(project)
+                for project in pdb.list_projects(conn)
             ],
             "session_assignments": pdb.list_session_assignments(conn),
         }
@@ -1886,7 +1897,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _validate_project_body(body: Dict[str, Any], *, creating: bool) -> Optional[str]:
-        portable = {"name", "description", "icon", "color", "pinned"}
+        portable = {"name", "description", "pinned"}
         unsupported = set(body) - portable
         if unsupported:
             return "Unsupported project fields: " + ", ".join(sorted(unsupported))
@@ -1902,12 +1913,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 not isinstance(description, str) or len(description) > 4000
             ):
                 return "Project description must be at most 4000 characters."
-        for key in ("icon", "color"):
-            value = body.get(key)
-            if key in body and value is not None and (
-                not isinstance(value, str) or len(value) > 128
-            ):
-                return f"Project {key} must be at most 128 characters."
         if "pinned" in body and not isinstance(body.get("pinned"), bool):
             return "Project pinned must be a boolean."
         return None
@@ -1935,26 +1940,56 @@ class APIServerAdapter(BasePlatformAdapter):
         validation = self._validate_project_body(body, creating=True)
         if validation:
             return self._project_request_error(validation, 400, "invalid_project")
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if not idempotency_key:
+            return self._project_request_error(
+                "Idempotency-Key is required for project creation.",
+                428,
+                "precondition_required",
+            )
+        if len(idempotency_key) > 128 or any(
+            ord(char) < 33 or ord(char) > 126 for char in idempotency_key
+        ):
+            return self._project_request_error(
+                "Invalid Idempotency-Key.", 400, "invalid_idempotency_key"
+            )
+        fingerprint = hashlib.sha256(
+            json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
         from hermes_cli import projects_db as pdb
         try:
             with pdb.connect_closing() as conn:
-                precondition = self._check_project_precondition(
-                    request, pdb.get_sync_revision(conn)
-                )
-                if precondition:
-                    return precondition
-                project_id = pdb.create_project(
-                    conn,
-                    name=body["name"],
-                    description=body.get("description"),
-                    icon=body.get("icon"),
-                    color=body.get("color"),
-                    pinned=body.get("pinned", False),
-                )
-                payload = self._project_snapshot(conn)
-                payload["project"] = pdb.get_project(conn, project_id).to_dict()
-                return self._project_json_response(payload, status=201)
+                with write_txn(conn):
+                    replay = pdb.get_sync_created_project(
+                        conn, idempotency_key, fingerprint
+                    )
+                    if replay is not None:
+                        payload = self._project_snapshot(conn)
+                        payload["project"] = self._project_sync_dict(replay)
+                        return self._project_json_response(payload)
+                    precondition = self._check_project_precondition(
+                        request, pdb.get_sync_revision(conn)
+                    )
+                    if precondition:
+                        return precondition
+                    project_id = pdb.create_project(
+                        conn,
+                        name=body["name"],
+                        description=body.get("description"),
+                        pinned=body.get("pinned", False),
+                    )
+                    pdb.remember_sync_created_project(
+                        conn, idempotency_key, fingerprint, project_id
+                    )
+                    payload = self._project_snapshot(conn)
+                    created_project = pdb.get_project(conn, project_id)
+                    if created_project is None:
+                        raise RuntimeError("created project disappeared")
+                    payload["project"] = self._project_sync_dict(created_project)
+                    return self._project_json_response(payload, status=201)
+        except pdb.SyncCreatedProjectGone as exc:
+            return self._project_request_error(str(exc), 410, "project_gone")
         except ValueError as exc:
             return self._project_request_error(str(exc), 400, "invalid_project")
         except Exception:
@@ -1976,25 +2011,27 @@ class APIServerAdapter(BasePlatformAdapter):
         project_id = request.match_info.get("project_id", "")
         try:
             with pdb.connect_closing() as conn:
-                precondition = self._check_project_precondition(
-                    request, pdb.get_sync_revision(conn)
-                )
-                if precondition:
-                    return precondition
-                if pdb.get_project(conn, project_id) is None:
-                    return self._project_request_error("Project not found.", 404, "not_found")
-                pdb.update_project(
-                    conn,
-                    project_id,
-                    name=body.get("name") if "name" in body else None,
-                    description=body.get("description") if "description" in body else None,
-                    icon=body.get("icon") if "icon" in body else None,
-                    color=body.get("color") if "color" in body else None,
-                    pinned=body.get("pinned") if "pinned" in body else None,
-                )
-                payload = self._project_snapshot(conn)
-                payload["project"] = pdb.get_project(conn, project_id).to_dict()
-                return self._project_json_response(payload)
+                with write_txn(conn):
+                    precondition = self._check_project_precondition(
+                        request, pdb.get_sync_revision(conn)
+                    )
+                    if precondition:
+                        return precondition
+                    if pdb.get_project(conn, project_id) is None:
+                        return self._project_request_error("Project not found.", 404, "not_found")
+                    pdb.update_project(
+                        conn,
+                        project_id,
+                        name=body.get("name") if "name" in body else None,
+                        description=body.get("description") if "description" in body else None,
+                        pinned=body.get("pinned") if "pinned" in body else None,
+                    )
+                    payload = self._project_snapshot(conn)
+                    updated_project = pdb.get_project(conn, project_id)
+                    if updated_project is None:
+                        raise RuntimeError("updated project disappeared")
+                    payload["project"] = self._project_sync_dict(updated_project)
+                    return self._project_json_response(payload)
         except ValueError as exc:
             return self._project_request_error(str(exc), 400, "invalid_project")
         except Exception:
@@ -2009,14 +2046,15 @@ class APIServerAdapter(BasePlatformAdapter):
         project_id = request.match_info.get("project_id", "")
         try:
             with pdb.connect_closing() as conn:
-                precondition = self._check_project_precondition(
-                    request, pdb.get_sync_revision(conn)
-                )
-                if precondition:
-                    return precondition
-                if not pdb.delete_project(conn, project_id):
-                    return self._project_request_error("Project not found.", 404, "not_found")
-                return self._project_json_response(self._project_snapshot(conn))
+                with write_txn(conn):
+                    precondition = self._check_project_precondition(
+                        request, pdb.get_sync_revision(conn)
+                    )
+                    if precondition:
+                        return precondition
+                    if not pdb.delete_project(conn, project_id):
+                        return self._project_request_error("Project not found.", 404, "not_found")
+                    return self._project_json_response(self._project_snapshot(conn))
         except Exception:
             logger.exception("DELETE /api/projects failed")
             return web.json_response(_openai_error("Failed to delete project", err_type="server_error"), status=500)
@@ -2033,15 +2071,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._project_request_error("Session not found.", 404, "not_found")
         try:
             with pdb.connect_closing() as conn:
-                precondition = self._check_project_precondition(
-                    request, pdb.get_sync_revision(conn)
-                )
-                if precondition:
-                    return precondition
-                if pdb.get_project(conn, project_id) is None:
-                    return self._project_request_error("Project not found.", 404, "not_found")
-                pdb.assign_session(conn, project_id, session_id)
-                return self._project_json_response(self._project_snapshot(conn))
+                with write_txn(conn):
+                    precondition = self._check_project_precondition(
+                        request, pdb.get_sync_revision(conn)
+                    )
+                    if precondition:
+                        return precondition
+                    if pdb.get_project(conn, project_id) is None:
+                        return self._project_request_error("Project not found.", 404, "not_found")
+                    pdb.assign_session(conn, project_id, session_id)
+                    return self._project_json_response(self._project_snapshot(conn))
         except ValueError as exc:
             return self._project_request_error(str(exc), 400, "invalid_assignment")
         except Exception:
@@ -2059,13 +2098,14 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._project_request_error("Session not found.", 404, "not_found")
         try:
             with pdb.connect_closing() as conn:
-                precondition = self._check_project_precondition(
-                    request, pdb.get_sync_revision(conn)
-                )
-                if precondition:
-                    return precondition
-                pdb.exclude_session(conn, session_id)
-                return self._project_json_response(self._project_snapshot(conn))
+                with write_txn(conn):
+                    precondition = self._check_project_precondition(
+                        request, pdb.get_sync_revision(conn)
+                    )
+                    if precondition:
+                        return precondition
+                    pdb.exclude_session(conn, session_id)
+                    return self._project_json_response(self._project_snapshot(conn))
         except ValueError as exc:
             return self._project_request_error(str(exc), 400, "invalid_assignment")
         except Exception:

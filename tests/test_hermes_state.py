@@ -2148,6 +2148,111 @@ class TestDeleteAndExport:
     def test_delete_nonexistent(self, db):
         assert db.delete_session("nope") is False
 
+    def test_delete_session_removes_project_assignment_from_sibling_database(
+        self, tmp_path
+    ):
+        from hermes_cli import projects_db as pdb
+
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        projects_path = tmp_path / "projects.db"
+        try:
+            session_db.create_session(session_id="assigned", source="cli")
+            with pdb.connect_closing(db_path=projects_path) as conn:
+                project_id = pdb.create_project(conn, name="Assigned")
+                pdb.assign_session(conn, project_id, "assigned")
+
+            assert session_db.delete_session("assigned") is True
+
+            with pdb.connect_closing(db_path=projects_path) as conn:
+                assert "assigned" not in pdb.list_session_assignments(conn)
+        finally:
+            session_db.close()
+
+    def test_delete_session_does_not_create_missing_projects_database(self, tmp_path):
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="unassigned", source="cli")
+
+            assert session_db.delete_session("unassigned") is True
+
+            assert not (tmp_path / "projects.db").exists()
+        finally:
+            session_db.close()
+
+    def test_project_cleanup_failure_preserves_session(self, tmp_path, monkeypatch):
+        from hermes_cli import projects_db as pdb
+
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        projects_path = tmp_path / "projects.db"
+        try:
+            session_db.create_session(session_id="assigned", source="cli")
+            with pdb.connect_closing(db_path=projects_path) as conn:
+                project_id = pdb.create_project(conn, name="Assigned")
+                pdb.assign_session(conn, project_id, "assigned")
+
+            def fail_cleanup(conn, session_id):
+                raise RuntimeError("injected project cleanup failure")
+
+            monkeypatch.setattr(pdb, "unassign_session", fail_cleanup)
+
+            with pytest.raises(RuntimeError, match="project cleanup failure"):
+                session_db.delete_session("assigned")
+
+            assert session_db.get_session("assigned") is not None
+        finally:
+            session_db.close()
+
+    @pytest.mark.parametrize(
+        "deletion_path",
+        [
+            "delete_session_if_empty",
+            "delete_sessions",
+            "delete_empty_sessions",
+            "prune_sessions",
+            "prune_empty_ghost_sessions",
+        ],
+    )
+    def test_all_permanent_deletion_paths_remove_project_assignments(
+        self, tmp_path, deletion_path
+    ):
+        from hermes_cli import projects_db as pdb
+
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        projects_path = tmp_path / "projects.db"
+        session_id = f"assigned-{deletion_path}"
+        try:
+            source = "tui" if deletion_path == "prune_empty_ghost_sessions" else "cli"
+            session_db.create_session(session_id=session_id, source=source)
+            session_db.end_session(session_id, end_reason="done")
+            if deletion_path == "prune_empty_ghost_sessions":
+                session_db._execute_write(
+                    lambda conn: conn.execute(
+                        "UPDATE sessions SET started_at = ? WHERE id = ?",
+                        (time.time() - 2 * 86400, session_id),
+                    )
+                )
+            with pdb.connect_closing(db_path=projects_path) as conn:
+                project_id = pdb.create_project(conn, name="Assigned")
+                pdb.assign_session(conn, project_id, session_id)
+
+            if deletion_path == "delete_session_if_empty":
+                deleted = session_db.delete_session_if_empty(session_id)
+            elif deletion_path == "delete_sessions":
+                deleted = session_db.delete_sessions([session_id])
+            elif deletion_path == "delete_empty_sessions":
+                deleted = session_db.delete_empty_sessions()
+            elif deletion_path == "prune_sessions":
+                deleted = session_db.prune_sessions(older_than_days=None)
+            else:
+                deleted = session_db.prune_empty_ghost_sessions()
+
+            assert deleted
+            assert session_db.get_session(session_id) is None
+            with pdb.connect_closing(db_path=projects_path) as conn:
+                assert session_id not in pdb.list_session_assignments(conn)
+        finally:
+            session_db.close()
+
     def test_resolve_session_id_exact(self, db):
         db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
         assert db.resolve_session_id("20260315_092437_c9a6ff") == "20260315_092437_c9a6ff"

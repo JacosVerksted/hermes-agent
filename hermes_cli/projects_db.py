@@ -24,6 +24,8 @@ The schema is intentionally small and additive: column additions go through
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
 import re
 import secrets
@@ -35,6 +37,11 @@ from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
+
+
+def _write_scope(conn: sqlite3.Connection):
+    """Open a write transaction, or reuse the caller's existing atomic scope."""
+    return contextlib.nullcontext(conn) if conn.in_transaction else write_txn(conn)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -287,7 +294,7 @@ def _migrate_session_assignments(conn: sqlite3.Connection) -> None:
     if not bool(project_id["notnull"]) and "previous_cwd" in columns:
         return
 
-    with write_txn(conn):
+    with _write_scope(conn):
         conn.execute(
             "ALTER TABLE project_session_assignments "
             "RENAME TO project_session_assignments_legacy"
@@ -462,7 +469,7 @@ def create_project(
     if primary is None and folder_paths:
         primary = folder_paths[0]
 
-    with write_txn(conn):
+    with _write_scope(conn):
         unique = _unique_slug(conn, slug_candidate)
         conn.execute(
             "INSERT INTO projects "
@@ -562,7 +569,7 @@ def update_project(
     if not sets:
         return False
     params.append(project_id)
-    with write_txn(conn):
+    with _write_scope(conn):
         cur = conn.execute(
             f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
         )
@@ -588,7 +595,7 @@ def add_folder(
     if get_project(conn, project_id) is None:
         raise ValueError(f"no such project: {project_id}")
     now = _now()
-    with write_txn(conn):
+    with _write_scope(conn):
         conn.execute(
             "INSERT OR IGNORE INTO project_folders "
             "(project_id, path, label, is_primary, added_at) "
@@ -618,7 +625,7 @@ def add_folder(
 def remove_folder(conn: sqlite3.Connection, project_id: str, path: str) -> bool:
     """Remove a folder from a project. Repoints primary if it was primary."""
     norm = _normalize_path(path)
-    with write_txn(conn):
+    with _write_scope(conn):
         was_primary = conn.execute(
             "SELECT is_primary FROM project_folders "
             "WHERE project_id = ? AND path = ?",
@@ -666,7 +673,7 @@ def _set_primary_locked(
 
 def set_primary(conn: sqlite3.Connection, project_id: str, path: str) -> bool:
     norm = _normalize_path(path)
-    with write_txn(conn):
+    with _write_scope(conn):
         exists = conn.execute(
             "SELECT 1 FROM project_folders WHERE project_id = ? AND path = ?",
             (project_id, norm),
@@ -678,7 +685,7 @@ def set_primary(conn: sqlite3.Connection, project_id: str, path: str) -> bool:
 
 
 def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    with write_txn(conn):
+    with _write_scope(conn):
         cur = conn.execute(
             "UPDATE projects SET archived = 1 WHERE id = ?", (project_id,)
         )
@@ -686,7 +693,7 @@ def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 
 def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    with write_txn(conn):
+    with _write_scope(conn):
         cur = conn.execute(
             "UPDATE projects SET archived = 0 WHERE id = ?", (project_id,)
         )
@@ -695,7 +702,7 @@ def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     """Hard-delete a project and its folders (cascade)."""
-    with write_txn(conn):
+    with _write_scope(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return cur.rowcount > 0
 
@@ -713,7 +720,7 @@ def assign_session(
         raise ValueError("session_id required")
     if get_project(conn, project_id) is None:
         raise ValueError(f"no such project: {project_id}")
-    with write_txn(conn):
+    with _write_scope(conn):
         conn.execute(
             "INSERT INTO project_session_assignments "
             "(session_id, project_id, assigned_at, previous_cwd) "
@@ -735,7 +742,7 @@ def unassign_session(conn: sqlite3.Connection, session_id: str) -> bool:
     sid = str(session_id or "").strip()
     if not sid:
         return False
-    with write_txn(conn):
+    with _write_scope(conn):
         cur = conn.execute(
             "DELETE FROM project_session_assignments WHERE session_id = ?", (sid,)
         )
@@ -756,7 +763,7 @@ def exclude_session(conn: sqlite3.Connection, session_id: str) -> Optional[str]:
     if not sid:
         raise ValueError("session_id required")
     previous = previous_session_cwd(conn, sid)
-    with write_txn(conn):
+    with _write_scope(conn):
         conn.execute(
             "INSERT INTO project_session_assignments "
             "(session_id, project_id, assigned_at, previous_cwd) VALUES (?, NULL, ?, ?) "
@@ -801,9 +808,64 @@ def get_sync_revision(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _sync_create_meta_key(idempotency_key: str) -> str:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"sync_create:{digest}"
+
+
+class SyncCreatedProjectGone(ValueError):
+    """A prior idempotent create was later deleted and must not be replayed."""
+
+
+def get_sync_created_project(
+    conn: sqlite3.Connection,
+    idempotency_key: str,
+    payload_fingerprint: str,
+) -> Optional[Project]:
+    """Resolve a prior idempotent create, rejecting key reuse for new data."""
+    row = conn.execute(
+        "SELECT value FROM project_meta WHERE key = ?",
+        (_sync_create_meta_key(idempotency_key),),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        record = json.loads(row[0])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if record.get("fingerprint") != payload_fingerprint:
+        raise ValueError("Idempotency-Key was already used for different project data")
+    project = get_project(conn, str(record.get("project_id", "")))
+    if project is None or project.archived:
+        raise SyncCreatedProjectGone(
+            "The idempotently created project is no longer active"
+        )
+    return project
+
+
+def remember_sync_created_project(
+    conn: sqlite3.Connection,
+    idempotency_key: str,
+    payload_fingerprint: str,
+    project_id: str,
+) -> None:
+    """Persist an idempotent create mapping in the canonical project database."""
+    value = json.dumps(
+        {"fingerprint": payload_fingerprint, "project_id": project_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with _write_scope(conn):
+        conn.execute(
+            "INSERT INTO project_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_sync_create_meta_key(idempotency_key), value),
+        )
+
+
 def set_active(conn: sqlite3.Connection, project_id: Optional[str]) -> None:
     """Set (or clear, when ``None``) the active project pointer."""
-    with write_txn(conn):
+    with _write_scope(conn):
         if project_id is None:
             conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
         else:
@@ -849,7 +911,7 @@ def record_discovered_repos(
             continue
         rows.append((norm, (label or os.path.basename(norm) or norm), now))
 
-    with write_txn(conn):
+    with _write_scope(conn):
         if replace:
             conn.execute("DELETE FROM discovered_repos")
         if rows:

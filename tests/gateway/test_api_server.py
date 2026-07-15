@@ -697,6 +697,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         "/api/projects/{project_id}/sessions/{session_id}",
         adapter._handle_projects_unassign_session,
     )
+    app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/v1/profile/context", adapter._handle_profile_context, allow_head=False)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
@@ -1155,6 +1156,79 @@ class TestProjectsEndpoint:
         assert response.status == 400
 
     @pytest.mark.asyncio
+    async def test_project_create_requires_idempotency_key(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            response = await cli.post(
+                "/api/projects",
+                headers={"If-Match": '"0"'},
+                json={"name": "Missing key"},
+            )
+        assert response.status == 428
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["icon", "color"])
+    async def test_project_sync_rejects_non_hearth_portable_fields(
+        self, auth_adapter, field
+    ):
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            project_id = pdb.create_project(conn, name="Existing")
+            revision = pdb.get_sync_revision(conn)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            created = await cli.post(
+                "/api/projects",
+                headers={
+                    "If-Match": f'"{revision}"',
+                    "Idempotency-Key": f"unsupported-{field}",
+                },
+                json={"name": "Unsupported", field: "value"},
+            )
+            updated = await cli.patch(
+                f"/api/projects/{project_id}",
+                headers={"If-Match": f'"{revision}"'},
+                json={field: "value"},
+            )
+            created_payload = await created.json()
+            updated_payload = await updated.json()
+
+        assert created.status == 400
+        assert created_payload["error"]["code"] == "invalid_project"
+        assert updated.status == 400
+        assert updated_payload["error"]["code"] == "invalid_project"
+
+    @pytest.mark.asyncio
+    async def test_project_snapshot_does_not_expose_server_filesystem_metadata(self, auth_adapter):
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            project_id = pdb.create_project(
+                conn,
+                name="Private canonical project",
+                folders=["/srv/private/rick/source"],
+                primary_path="/srv/private/rick/source",
+            )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            response = await cli.get("/api/projects")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["projects"] == [
+            {
+                "id": project_id,
+                "name": "Private canonical project",
+                "description": None,
+                "pinned": False,
+            }
+        ]
+        assert "/srv/private" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
     async def test_project_sync_lifecycle_preserves_conversation(self, auth_adapter):
         session_db = auth_adapter._ensure_session_db()
         session_db.create_session("s_project_api", "api_server")
@@ -1167,7 +1241,10 @@ class TestProjectsEndpoint:
 
             created = await cli.post(
                 "/api/projects",
-                headers={"If-Match": initial.headers["ETag"]},
+                headers={
+                    "If-Match": initial.headers["ETag"],
+                    "Idempotency-Key": "local-project-hearth",
+                },
                 json={
                     "name": "Hearth",
                     "description": "Mobile work",
@@ -1178,7 +1255,7 @@ class TestProjectsEndpoint:
             create_etag = created.headers["ETag"]
             project = (await created.json())["project"]
             assert project["pinned"] is True
-            assert project["folders"] == []
+            assert set(project) == {"id", "name", "description", "pinned"}
 
             listed = await cli.get("/api/projects")
             assert listed.status == 200
@@ -1187,6 +1264,33 @@ class TestProjectsEndpoint:
             assert [item["id"] for item in snapshot["projects"]] == [project["id"]]
             assert snapshot["session_assignments"] == {}
             assert listed.headers["ETag"] == create_etag
+
+            replayed = await cli.post(
+                "/api/projects",
+                headers={
+                    "If-Match": initial.headers["ETag"],
+                    "Idempotency-Key": "local-project-hearth",
+                },
+                json={
+                    "name": "Hearth",
+                    "description": "Mobile work",
+                    "pinned": True,
+                },
+            )
+            assert replayed.status == 200
+            replayed_snapshot = await replayed.json()
+            assert replayed_snapshot["project"]["id"] == project["id"]
+            assert len(replayed_snapshot["projects"]) == 1
+
+            mismatched_replay = await cli.post(
+                "/api/projects",
+                headers={
+                    "If-Match": create_etag,
+                    "Idempotency-Key": "local-project-hearth",
+                },
+                json={"name": "Different project"},
+            )
+            assert mismatched_replay.status == 400
 
             stale = await cli.patch(
                 f"/api/projects/{project['id']}",
@@ -1228,7 +1332,139 @@ class TestProjectsEndpoint:
             final = await deleted.json()
             assert final["projects"] == []
             assert final["session_assignments"] == {"s_project_api": None}
+
+            gone = await cli.post(
+                "/api/projects",
+                headers={
+                    "If-Match": deleted.headers["ETag"],
+                    "Idempotency-Key": "local-project-hearth",
+                },
+                json={
+                    "name": "Hearth",
+                    "description": "Mobile work",
+                    "pinned": True,
+                },
+            )
+            assert gone.status == 410
+            after_gone = await cli.get("/api/projects")
+            assert (await after_gone.json())["projects"] == []
             assert session_db.get_session("s_project_api") is not None
+
+    @pytest.mark.asyncio
+    async def test_archived_project_is_not_returned_by_idempotent_create_replay(
+        self, auth_adapter
+    ):
+        from hermes_cli import projects_db as pdb
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            initial = await cli.get("/api/projects")
+            request_headers = {
+                "If-Match": initial.headers["ETag"],
+                "Idempotency-Key": "archive-before-replay",
+            }
+            body = {"name": "Archive me"}
+            created = await cli.post(
+                "/api/projects", headers=request_headers, json=body
+            )
+            project_id = (await created.json())["project"]["id"]
+
+            with pdb.connect_closing() as conn:
+                assert pdb.archive_project(conn, project_id) is True
+
+            replayed = await cli.post(
+                "/api/projects", headers=request_headers, json=body
+            )
+            replay_payload = await replayed.json()
+            snapshot = await cli.get("/api/projects")
+            snapshot_payload = await snapshot.json()
+
+        assert replayed.status == 410
+        assert replay_payload["error"]["code"] == "project_gone"
+        assert snapshot_payload["projects"] == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_project_writes_allow_only_one_revision_winner(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            initial = await cli.get("/api/projects")
+            created = await cli.post(
+                "/api/projects",
+                headers={
+                    "If-Match": initial.headers["ETag"],
+                    "Idempotency-Key": "concurrent-project",
+                },
+                json={"name": "Before"},
+            )
+            created_payload = await created.json()
+            project_id = created_payload["project"]["id"]
+            revision = created.headers["ETag"]
+
+            first, second = await asyncio.gather(
+                cli.patch(
+                    f"/api/projects/{project_id}",
+                    headers={"If-Match": revision},
+                    json={"name": "First"},
+                ),
+                cli.patch(
+                    f"/api/projects/{project_id}",
+                    headers={"If-Match": revision},
+                    json={"name": "Second"},
+                ),
+            )
+            statuses = sorted([first.status, second.status])
+            final = await cli.get("/api/projects")
+            final_payload = await final.json()
+
+        assert statuses == [200, 412]
+        assert final_payload["projects"][0]["name"] in {"First", "Second"}
+        assert final_payload["revision"] == created_payload["revision"] + 1
+
+    @pytest.mark.asyncio
+    async def test_project_create_rolls_back_if_idempotency_record_fails(self, auth_adapter):
+        from hermes_cli import projects_db as pdb
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            initial = await cli.get("/api/projects")
+            with patch.object(
+                pdb,
+                "remember_sync_created_project",
+                side_effect=RuntimeError("injected idempotency failure"),
+            ):
+                failed = await cli.post(
+                    "/api/projects",
+                    headers={
+                        "If-Match": initial.headers["ETag"],
+                        "Idempotency-Key": "atomic-create",
+                    },
+                    json={"name": "Must roll back"},
+                )
+            after = await cli.get("/api/projects")
+            snapshot = await after.json()
+
+        assert failed.status == 500
+        assert snapshot["projects"] == []
+        assert snapshot["revision"] == 0
+
+    @pytest.mark.asyncio
+    async def test_deleting_session_removes_canonical_project_assignment(self, auth_adapter):
+        from hermes_cli import projects_db as pdb
+
+        session_db = auth_adapter._ensure_session_db()
+        session_db.create_session("s_delete_assignment", "api_server")
+        with pdb.connect_closing() as conn:
+            project_id = pdb.create_project(conn, name="Delete lifecycle")
+            pdb.assign_session(conn, project_id, "s_delete_assignment")
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            response = await cli.delete("/api/sessions/s_delete_assignment")
+            assert response.status == 200
+            payload = await response.json()
+        assert payload["deleted"] is True
+        with pdb.connect_closing() as conn:
+            assert "s_delete_assignment" not in pdb.list_session_assignments(conn)
 
 
 # ---------------------------------------------------------------------------
