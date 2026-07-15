@@ -221,6 +221,32 @@ Returns a machine-readable description of the API server's stable surface for ex
 
 Use this endpoint when integrating dashboards, browser UIs, or control planes so they can discover whether the running Hermes version supports runs, streaming, cancellation, and session continuity without depending on private Python internals.
 
+### GET /v1/profile/context
+
+Returns a fixed, read-only view of the active profile's `SOUL.md`, `memories/MEMORY.md`, and `memories/USER.md`. This endpoint is disabled by default because these files contain identity and personal memory data.
+
+Enable it explicitly, then restart the gateway:
+
+```bash
+hermes config set gateway.api_server.profile_context_read true
+hermes gateway restart
+```
+
+When enabled on a platform with secure descriptor-relative file opens, `/v1/capabilities` advertises `features.profile_context_read` and `endpoints.profile_context`. Clients must discover the capability before requesting the endpoint.
+
+```json
+{
+  "object": "hermes.profile.context",
+  "files": {
+    "SOUL.md": {"present": true, "content": "...", "truncated": false},
+    "MEMORY.md": {"present": false, "content": "", "truncated": false},
+    "USER.md": {"present": false, "content": "", "truncated": false}
+  }
+}
+```
+
+Reads are bearer-authenticated, limited to 128 KiB per allowlisted regular file, do not follow symlinks, run off the event loop, and return `Cache-Control: no-store`. The endpoint accepts no client-supplied filenames or paths and provides no write operation. Disable it with `hermes config set gateway.api_server.profile_context_read false` followed by a gateway restart.
+
 ### GET /health
 
 Health check. Returns `{"status": "ok"}`. Also available at **GET /v1/health** for OpenAI-compatible clients that expect the `/v1/` prefix.

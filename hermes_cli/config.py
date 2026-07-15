@@ -3014,6 +3014,11 @@ DEFAULT_CONFIG = {
             # bounding CPU / memory / upstream-LLM-quota exhaustion from a
             # request flood. Set to 0 to disable the cap entirely.
             "max_concurrent_runs": 10,
+            # Expose the active profile's SOUL.md, memories/MEMORY.md, and
+            # memories/USER.md through the authenticated read-only
+            # /v1/profile/context endpoint. Disabled by default because these
+            # files contain identity and personal memory data.
+            "profile_context_read": False,
         },
     },
 

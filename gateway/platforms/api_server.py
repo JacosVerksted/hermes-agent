@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /v1/profile/context         — read-only allowlisted profile identity and memory files
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -41,6 +42,7 @@ from functools import wraps
 import logging
 import os
 import socket as _socket
+import stat
 import re
 import sqlite3
 import time
@@ -71,6 +73,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +108,45 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_PROFILE_CONTEXT_FILE_BYTES = 131_072  # 128 KiB per allowlisted file
+PROFILE_CONTEXT_FILES = {
+    "SOUL.md": ("SOUL.md",),
+    "MEMORY.md": ("memories", "MEMORY.md"),
+    "USER.md": ("memories", "USER.md"),
+}
+
+
+def _profile_context_secure_open_supported() -> bool:
+    """Return whether this platform exposes the flags required for safe reads."""
+    return os.open in getattr(os, "supports_dir_fd", set()) and all(
+        isinstance(getattr(os, flag, None), int)
+        for flag in ("O_DIRECTORY", "O_NOFOLLOW")
+    )
+
+
+def _read_profile_context_file(root: Path, relative_parts: tuple[str, ...]) -> Optional[bytes]:
+    """Read one fixed profile file without following replaceable symlinks."""
+    if not _profile_context_secure_open_supported():
+        return None
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | close_on_exec
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | close_on_exec
+    descriptors: List[int] = []
+    try:
+        descriptors.append(os.open(root, directory_flags))
+        for directory in relative_parts[:-1]:
+            descriptors.append(os.open(directory, directory_flags, dir_fd=descriptors[-1]))
+        descriptors.append(os.open(relative_parts[-1], file_flags, dir_fd=descriptors[-1]))
+        file_descriptor = descriptors[-1]
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            return None
+        return os.read(file_descriptor, MAX_PROFILE_CONTEXT_FILE_BYTES + 1)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -765,6 +807,25 @@ _SECURITY_HEADERS = {
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
+    async def profile_context_no_store_middleware(request, handler):
+        """Prevent caching of every controllable profile-context response."""
+        if request.path != "/v1/profile/context":
+            return await handler(request)
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            exc.headers["Cache-Control"] = "no-store"
+            exc.headers["Pragma"] = "no-cache"
+            raise
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+else:
+    profile_context_no_store_middleware = None  # type: ignore[assignment]
+
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
         response = await handler(request)
@@ -926,6 +987,9 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
+        self._profile_context_read_enabled: bool = (
+            self._resolve_profile_context_read_enabled()
         )
         # model_routes: maps incoming ``model`` field values to specific
         # provider/model configs so one API server instance can serve
@@ -1095,6 +1159,23 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return default
         return max(0, value)
+
+    @staticmethod
+    def _resolve_profile_context_read_enabled() -> bool:
+        """Read the explicit profile-context privacy opt-in from config.yaml."""
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            raw = cfg_get(
+                load_config(),
+                "gateway",
+                "api_server",
+                "profile_context_read",
+                default=False,
+            )
+        except Exception:
+            return False
+        return _coerce_request_bool(raw, default=False)
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -1635,7 +1716,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        return web.json_response({
+        profile_context_supported = (
+            self._profile_context_read_enabled
+            and _profile_context_secure_open_supported()
+        )
+        payload = {
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
@@ -1672,6 +1757,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
+                "profile_context_read": True,
                 "skills_api": True,
                 "audio_api": False,
                 "realtime_voice": False,
@@ -1692,6 +1778,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "profile_context": {"method": "GET", "path": "/v1/profile/context"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -1702,7 +1789,73 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
+        }
+        if not profile_context_supported:
+            payload["features"].pop("profile_context_read", None)
+            payload["endpoints"].pop("profile_context", None)
+        return web.json_response(payload)
+
+    async def _handle_profile_context(self, request: "web.Request") -> "web.Response":
+        """GET /v1/profile/context — return a fixed read-only profile file set."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            auth_err.headers["Cache-Control"] = "no-store"
+            auth_err.headers["Pragma"] = "no-cache"
+            return auth_err
+
+        if not self._profile_context_read_enabled:
+            return web.json_response(
+                _openai_error(
+                    "Not found.",
+                    err_type="invalid_request_error",
+                    code="not_found",
+                ),
+                status=404,
+            )
+
+        if not _profile_context_secure_open_supported():
+            return web.json_response(
+                _openai_error(
+                    "Profile context reads are not supported on this platform.",
+                    err_type="server_error",
+                    code="profile_context_unsupported",
+                ),
+                status=501,
+            )
+
+        root = get_hermes_home()
+        files: Dict[str, Dict[str, Any]] = {}
+        for name, relative_parts in PROFILE_CONTEXT_FILES.items():
+            entry: Dict[str, Any] = {
+                "present": False,
+                "content": "",
+                "truncated": False,
+            }
+            try:
+                raw = await asyncio.to_thread(
+                    _read_profile_context_file,
+                    root,
+                    relative_parts,
+                )
+                if raw is None:
+                    files[name] = entry
+                    continue
+                entry["present"] = True
+                entry["truncated"] = len(raw) > MAX_PROFILE_CONTEXT_FILE_BYTES
+                entry["content"] = raw[:MAX_PROFILE_CONTEXT_FILE_BYTES].decode(
+                    "utf-8", errors="replace"
+                )
+            except (OSError, RuntimeError):
+                pass
+            files[name] = entry
+
+        response = web.json_response({
+            "object": "hermes.profile.context",
+            "files": files,
         })
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4973,7 +5126,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [
+                mw
+                for mw in (
+                    profile_context_no_store_middleware,
+                    cors_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                )
+                if mw is not None
+            ]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
@@ -4981,6 +5143,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/profile/context", self._handle_profile_context, allow_head=False)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)

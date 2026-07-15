@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
+    profile_context_no_store_middleware,
     security_headers_middleware,
 )
 
@@ -645,7 +646,11 @@ class TestConcurrencyCap:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(
+    api_key: str = "",
+    cors_origins=None,
+    profile_context_read: bool = True,
+) -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
@@ -653,12 +658,24 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
     if cors_origins is not None:
         extra["cors_origins"] = cors_origins
     config = PlatformConfig(enabled=True, extra=extra)
-    return APIServerAdapter(config)
+    adapter = APIServerAdapter(config)
+    # Most endpoint fixtures exercise the explicitly enabled state. Dedicated
+    # tests below prove the real config default remains disabled.
+    adapter._profile_context_read_enabled = profile_context_read
+    return adapter
 
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    mws = [
+        mw
+        for mw in (
+            profile_context_no_store_middleware,
+            cors_middleware,
+            security_headers_middleware,
+        )
+        if mw is not None
+    ]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
@@ -666,6 +683,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/v1/profile/context", adapter._handle_profile_context, allow_head=False)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -987,10 +1005,34 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["profile_context_read"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert data["endpoints"]["profile_context"] == {"method": "GET", "path": "/v1/profile/context"}
+
+    @pytest.mark.asyncio
+    async def test_does_not_advertise_profile_context_when_disabled(self):
+        adapter = _make_adapter(profile_context_read=False)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/capabilities")
+            assert response.status == 200
+            data = await response.json()
+
+        assert "profile_context_read" not in data["features"]
+        assert "profile_context" not in data["endpoints"]
+
+    def test_profile_context_config_defaults_disabled(self):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert APIServerAdapter._resolve_profile_context_read_enabled() is False
+
+    @pytest.mark.parametrize("configured", [True, "true", "yes", "on", 1])
+    def test_profile_context_config_accepts_explicit_opt_in(self, configured):
+        config = {"gateway": {"api_server": {"profile_context_read": configured}}}
+        with patch("hermes_cli.config.load_config", return_value=config):
+            assert APIServerAdapter._resolve_profile_context_read_enabled() is True
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -1006,6 +1048,232 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing_flag", ["O_DIRECTORY", "O_NOFOLLOW"])
+    async def test_does_not_advertise_profile_context_without_secure_open_primitives(
+        self, adapter, monkeypatch, missing_flag
+    ):
+        monkeypatch.delattr(os, missing_flag)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/capabilities")
+            assert response.status == 200
+            data = await response.json()
+
+        assert "profile_context_read" not in data["features"]
+        assert "profile_context" not in data["endpoints"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_advertise_profile_context_without_open_dir_fd_support(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) - {os.open})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/capabilities")
+            assert response.status == 200
+            data = await response.json()
+
+        assert "profile_context_read" not in data["features"]
+        assert "profile_context" not in data["endpoints"]
+
+
+# ---------------------------------------------------------------------------
+# /v1/profile/context endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestProfileContextEndpoint:
+    @pytest.mark.asyncio
+    async def test_disabled_feature_returns_non_disclosing_404_without_caching(self):
+        adapter = _make_adapter(profile_context_read=False)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/profile/context")
+            assert resp.status == 404
+            assert resp.headers["Cache-Control"] == "no-store"
+            data = await resp.json()
+
+        assert data["error"]["code"] == "not_found"
+        assert "profile" not in data["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_returns_only_allowlisted_profile_files_without_caching(self, adapter, tmp_path):
+        (tmp_path / "memories").mkdir()
+        (tmp_path / "SOUL.md").write_text("# Hermod\nQuick and candid.\n", encoding="utf-8")
+        (tmp_path / "memories" / "USER.md").write_text("# User\nPrefers concise answers.\n", encoding="utf-8")
+        (tmp_path / "secrets.txt").write_text("must never leave", encoding="utf-8")
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path, create=True):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/profile/context")
+                assert resp.status == 200
+                assert resp.headers["Cache-Control"] == "no-store"
+                data = await resp.json()
+
+        assert data["object"] == "hermes.profile.context"
+        assert set(data["files"]) == {"SOUL.md", "MEMORY.md", "USER.md"}
+        assert data["files"]["SOUL.md"] == {
+            "present": True,
+            "content": "# Hermod\nQuick and candid.\n",
+            "truncated": False,
+        }
+        assert data["files"]["MEMORY.md"] == {"present": False, "content": "", "truncated": False}
+        assert "secrets.txt" not in json.dumps(data)
+        assert "must never leave" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_requires_bearer_auth_when_configured(self, auth_adapter, tmp_path):
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path, create=True):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                denied = await cli.get("/v1/profile/context")
+                allowed = await cli.get(
+                    "/v1/profile/context",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+        assert denied.status == 401
+        assert denied.headers["Cache-Control"] == "no-store"
+        assert denied.headers["Pragma"] == "no-cache"
+        assert allowed.status == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing_flag", ["O_DIRECTORY", "O_NOFOLLOW"])
+    async def test_fails_closed_without_secure_open_primitives(
+        self, adapter, tmp_path, monkeypatch, missing_flag
+    ):
+        (tmp_path / "SOUL.md").write_text("must not be read", encoding="utf-8")
+        monkeypatch.delattr(os, missing_flag)
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/v1/profile/context")
+
+        assert response.status == 501
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Pragma"] == "no-cache"
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_without_open_dir_fd_support(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        (tmp_path / "SOUL.md").write_text("must not be read", encoding="utf-8")
+        monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) - {os.open})
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/v1/profile/context")
+
+        assert response.status == 501
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Pragma"] == "no-cache"
+
+    @pytest.mark.asyncio
+    async def test_bounds_each_file_and_marks_truncation(self, adapter, tmp_path):
+        (tmp_path / "memories").mkdir()
+        (tmp_path / "memories" / "MEMORY.md").write_text("x" * 140_000, encoding="utf-8")
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path, create=True):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                data = await (await cli.get("/v1/profile/context")).json()
+        memory = data["files"]["MEMORY.md"]
+        assert memory["truncated"] is True
+        assert len(memory["content"].encode("utf-8")) <= 131_072
+
+    @pytest.mark.asyncio
+    async def test_replaces_malformed_utf8_without_failing_response(self, adapter, tmp_path):
+        (tmp_path / "SOUL.md").write_bytes(b"before\xffafter")
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/v1/profile/context")
+                data = await response.json()
+
+        assert response.status == 200
+        assert data["files"]["SOUL.md"] == {
+            "present": True,
+            "content": "before\ufffdafter",
+            "truncated": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_refuses_allowlisted_symlink_that_escapes_hermes_home(self, adapter, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("must never leave", encoding="utf-8")
+        (home / "SOUL.md").symlink_to(outside)
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=home, create=True):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                data = await (await cli.get("/v1/profile/context")).json()
+        assert data["files"]["SOUL.md"] == {"present": False, "content": "", "truncated": False}
+        assert "must never leave" not in json.dumps(data)
+    @pytest.mark.asyncio
+    async def test_refuses_swap_to_external_symlink_at_open_boundary(self, adapter, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        soul = home / "SOUL.md"
+        soul.write_text("safe original", encoding="utf-8")
+        outside = tmp_path / "outside.txt"
+        outside.write_text("must never leave", encoding="utf-8")
+        original_open = os.open
+        swapped = False
+
+        def swap_at_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path == "SOUL.md" and not swapped:
+                swapped = True
+                soul.unlink()
+                soul.symlink_to(outside)
+            return original_open(path, flags, *args, **kwargs)
+
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=home):
+            with patch("gateway.platforms.api_server.os.open", side_effect=swap_at_open) as secured_open:
+                supported = (set(os.supports_dir_fd) - {original_open}) | {secured_open}
+                with patch.object(os, "supports_dir_fd", supported):
+                    app = _create_app(adapter)
+                    async with TestClient(TestServer(app)) as cli:
+                        data = await (await cli.get("/v1/profile/context")).json()
+        assert swapped is True
+        assert data["files"]["SOUL.md"] == {
+            "present": False,
+            "content": "",
+            "truncated": False,
+        }
+        assert "must never leave" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_reads_no_more_than_the_per_file_limit_plus_one_byte(self, adapter, tmp_path):
+        (tmp_path / "SOUL.md").write_bytes(b"x" * 1_000_000)
+        with (
+            patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path, create=True),
+            patch("gateway.platforms.api_server.os.read", wraps=os.read) as bounded_read,
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/profile/context")
+        assert resp.status == 200
+        assert bounded_read.call_count > 0
+        assert all(call.args[1] <= 131_073 for call in bounded_read.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_rejects_head_and_mutating_methods(self, adapter, tmp_path):
+        with patch("gateway.platforms.api_server.get_hermes_home", return_value=tmp_path, create=True):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                responses = [
+                    await cli.head("/v1/profile/context"),
+                    await cli.post("/v1/profile/context"),
+                    await cli.put("/v1/profile/context"),
+                    await cli.delete("/v1/profile/context"),
+                ]
+
+        for response in responses:
+            assert response.status == 405
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["Pragma"] == "no-cache"
 
 
 # ---------------------------------------------------------------------------
