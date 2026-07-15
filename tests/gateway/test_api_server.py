@@ -650,6 +650,7 @@ def _make_adapter(
     api_key: str = "",
     cors_origins=None,
     profile_context_read: bool = True,
+    project_sync: bool = True,
 ) -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
@@ -660,8 +661,9 @@ def _make_adapter(
     config = PlatformConfig(enabled=True, extra=extra)
     adapter = APIServerAdapter(config)
     # Most endpoint fixtures exercise the explicitly enabled state. Dedicated
-    # tests below prove the real config default remains disabled.
+    # tests below prove the real config defaults remain disabled.
     adapter._profile_context_read_enabled = profile_context_read
+    adapter._project_sync_enabled = project_sync
     return adapter
 
 
@@ -1023,6 +1025,26 @@ class TestCapabilitiesEndpoint:
 
         assert "profile_context_read" not in data["features"]
         assert "profile_context" not in data["endpoints"]
+
+    @pytest.mark.asyncio
+    async def test_advertises_project_sync_only_when_enabled(self, adapter):
+        for enabled in (True, False):
+            adapter._project_sync_enabled = enabled
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/v1/capabilities")
+                assert response.status == 200
+                data = await response.json()
+
+            assert (data["features"].get("project_sync") is True) is enabled
+            assert (data["endpoints"].get("projects") == {
+                "method": "GET",
+                "path": "/api/projects",
+            }) is enabled
+
+    def test_project_sync_config_defaults_disabled(self):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert APIServerAdapter._resolve_project_sync_enabled() is False
 
     def test_profile_context_config_defaults_disabled(self):
         with patch("hermes_cli.config.load_config", return_value={}):

@@ -991,6 +991,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._profile_context_read_enabled: bool = (
             self._resolve_profile_context_read_enabled()
         )
+        self._project_sync_enabled: bool = self._resolve_project_sync_enabled()
         # model_routes: maps incoming ``model`` field values to specific
         # provider/model configs so one API server instance can serve
         # multiple clients on different backends.
@@ -1171,6 +1172,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 "gateway",
                 "api_server",
                 "profile_context_read",
+                default=False,
+            )
+        except Exception:
+            return False
+        return _coerce_request_bool(raw, default=False)
+
+    @staticmethod
+    def _resolve_project_sync_enabled() -> bool:
+        """Read the explicit project synchronization opt-in from config.yaml."""
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            raw = cfg_get(
+                load_config(),
+                "gateway",
+                "api_server",
+                "project_sync",
                 default=False,
             )
         except Exception:
@@ -1758,6 +1776,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "profile_context_read": True,
+                "project_sync": True,
                 "skills_api": True,
                 "audio_api": False,
                 "realtime_voice": False,
@@ -1779,6 +1798,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "profile_context": {"method": "GET", "path": "/v1/profile/context"},
+                "projects": {"method": "GET", "path": "/api/projects"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -1793,6 +1813,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if not profile_context_supported:
             payload["features"].pop("profile_context_read", None)
             payload["endpoints"].pop("profile_context", None)
+        if not self._project_sync_enabled:
+            payload["features"].pop("project_sync", None)
+            payload["endpoints"].pop("projects", None)
         return web.json_response(payload)
 
     async def _handle_profile_context(self, request: "web.Request") -> "web.Response":
