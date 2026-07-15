@@ -3019,6 +3019,10 @@ DEFAULT_CONFIG = {
             # /v1/profile/context endpoint. Disabled by default because these
             # files contain identity and personal memory data.
             "profile_context_read": False,
+            # Expose the active profile's canonical projects.db through the
+            # authenticated, revision-checked /api/projects resource API.
+            # Disabled by default because this enables remote writes.
+            "project_sync": False,
         },
     },
 

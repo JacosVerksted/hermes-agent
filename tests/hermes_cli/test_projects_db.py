@@ -63,6 +63,38 @@ def test_create_get_list(conn):
     assert len(pdb.list_projects(conn)) == 1
 
 
+def test_pinned_state_roundtrip(conn):
+    pid = pdb.create_project(conn, name="Pinned", pinned=True)
+    assert pdb.get_project(conn, pid).pinned is True
+    assert pdb.get_project(conn, pid).to_dict()["pinned"] is True
+
+    assert pdb.update_project(conn, pid, pinned=False) is True
+    assert pdb.get_project(conn, pid).pinned is False
+
+
+def test_sync_revision_tracks_canonical_mutations(conn):
+    assert pdb.get_sync_revision(conn) == 0
+
+    pid = pdb.create_project(conn, name="Tracked")
+    after_create = pdb.get_sync_revision(conn)
+    assert after_create > 0
+
+    pdb.update_project(conn, pid, name="Renamed")
+    after_update = pdb.get_sync_revision(conn)
+    assert after_update > after_create
+
+    pdb.assign_session(conn, pid, "s_tracked")
+    after_assign = pdb.get_sync_revision(conn)
+    assert after_assign > after_update
+
+    pdb.exclude_session(conn, "s_tracked")
+    after_unassign = pdb.get_sync_revision(conn)
+    assert after_unassign > after_assign
+
+    pdb.delete_project(conn, pid)
+    assert pdb.get_sync_revision(conn) > after_unassign
+
+
 def test_slug_collision_disambiguates(conn):
     pdb.create_project(conn, name="Hermes Agent")
     pdb.create_project(conn, name="Hermes Agent")

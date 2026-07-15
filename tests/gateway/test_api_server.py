@@ -685,6 +685,18 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/api/projects", adapter._handle_projects_list)
+    app.router.add_post("/api/projects", adapter._handle_projects_create)
+    app.router.add_patch("/api/projects/{project_id}", adapter._handle_projects_update)
+    app.router.add_delete("/api/projects/{project_id}", adapter._handle_projects_delete)
+    app.router.add_put(
+        "/api/projects/{project_id}/sessions/{session_id}",
+        adapter._handle_projects_assign_session,
+    )
+    app.router.add_delete(
+        "/api/projects/{project_id}/sessions/{session_id}",
+        adapter._handle_projects_unassign_session,
+    )
     app.router.add_get("/v1/profile/context", adapter._handle_profile_context, allow_head=False)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
@@ -1027,12 +1039,16 @@ class TestCapabilitiesEndpoint:
         assert "profile_context" not in data["endpoints"]
 
     @pytest.mark.asyncio
-    async def test_advertises_project_sync_only_when_enabled(self, adapter):
+    async def test_advertises_project_sync_only_when_enabled(self):
+        adapter = _make_adapter(api_key="sk-secret")
         for enabled in (True, False):
             adapter._project_sync_enabled = enabled
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
-                response = await cli.get("/v1/capabilities")
+                response = await cli.get(
+                    "/v1/capabilities",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
                 assert response.status == 200
                 data = await response.json()
 
@@ -1041,6 +1057,17 @@ class TestCapabilitiesEndpoint:
                 "method": "GET",
                 "path": "/api/projects",
             }) is enabled
+
+    @pytest.mark.asyncio
+    async def test_does_not_advertise_project_sync_without_api_key(self):
+        adapter = _make_adapter(project_sync=True)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/capabilities")
+            assert response.status == 200
+            data = await response.json()
+        assert "project_sync" not in data["features"]
+        assert "projects" not in data["endpoints"]
 
     def test_project_sync_config_defaults_disabled(self):
         with patch("hermes_cli.config.load_config", return_value={}):
@@ -1099,6 +1126,109 @@ class TestCapabilitiesEndpoint:
 
         assert "profile_context_read" not in data["features"]
         assert "profile_context" not in data["endpoints"]
+
+
+# ---------------------------------------------------------------------------
+# /api/projects endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestProjectsEndpoint:
+    _AUTH = {"Authorization": "Bearer sk-secret"}
+
+    @pytest.mark.asyncio
+    async def test_disabled_feature_returns_404(self):
+        app = _create_app(_make_adapter(api_key="sk-secret", project_sync=False))
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            response = await cli.get("/api/projects")
+        assert response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_rejects_remote_filesystem_bindings(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            response = await cli.post(
+                "/api/projects",
+                headers={"If-Match": '"0"'},
+                json={"name": "Unsafe", "folders": ["/etc"]},
+            )
+        assert response.status == 400
+
+    @pytest.mark.asyncio
+    async def test_project_sync_lifecycle_preserves_conversation(self, auth_adapter):
+        session_db = auth_adapter._ensure_session_db()
+        session_db.create_session("s_project_api", "api_server")
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            initial = await cli.get("/api/projects")
+            assert initial.status == 200
+            assert (await initial.json())["revision"] == 0
+
+            created = await cli.post(
+                "/api/projects",
+                headers={"If-Match": initial.headers["ETag"]},
+                json={
+                    "name": "Hearth",
+                    "description": "Mobile work",
+                    "pinned": True,
+                },
+            )
+            assert created.status == 201
+            create_etag = created.headers["ETag"]
+            project = (await created.json())["project"]
+            assert project["pinned"] is True
+            assert project["folders"] == []
+
+            listed = await cli.get("/api/projects")
+            assert listed.status == 200
+            snapshot = await listed.json()
+            assert snapshot["revision"] > 0
+            assert [item["id"] for item in snapshot["projects"]] == [project["id"]]
+            assert snapshot["session_assignments"] == {}
+            assert listed.headers["ETag"] == create_etag
+
+            stale = await cli.patch(
+                f"/api/projects/{project['id']}",
+                headers={"If-Match": '"0"'},
+                json={"name": "Must not win"},
+            )
+            assert stale.status == 412
+
+            updated = await cli.patch(
+                f"/api/projects/{project['id']}",
+                headers={"If-Match": create_etag},
+                json={"name": "Hearth synced", "pinned": False},
+            )
+            assert updated.status == 200
+            update_etag = updated.headers["ETag"]
+            assert (await updated.json())["project"]["name"] == "Hearth synced"
+
+            assigned = await cli.put(
+                f"/api/projects/{project['id']}/sessions/s_project_api",
+                headers={"If-Match": update_etag},
+            )
+            assert assigned.status == 200
+            assignment_etag = assigned.headers["ETag"]
+            assert (await assigned.json())["session_assignments"] == {
+                "s_project_api": project["id"]
+            }
+
+            unknown = await cli.put(
+                f"/api/projects/{project['id']}/sessions/not-in-this-profile",
+                headers={"If-Match": assignment_etag},
+            )
+            assert unknown.status == 404
+
+            deleted = await cli.delete(
+                f"/api/projects/{project['id']}",
+                headers={"If-Match": assignment_etag},
+            )
+            assert deleted.status == 200
+            final = await deleted.json()
+            assert final["projects"] == []
+            assert final["session_assignments"] == {"s_project_api": None}
+            assert session_db.get_session("s_project_api") is not None
 
 
 # ---------------------------------------------------------------------------

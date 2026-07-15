@@ -1813,10 +1813,264 @@ class APIServerAdapter(BasePlatformAdapter):
         if not profile_context_supported:
             payload["features"].pop("profile_context_read", None)
             payload["endpoints"].pop("profile_context", None)
-        if not self._project_sync_enabled:
+        if not self._project_sync_enabled or not self._api_key:
             payload["features"].pop("project_sync", None)
             payload["endpoints"].pop("projects", None)
         return web.json_response(payload)
+
+    def _project_request_error(self, message: str, status: int, code: str) -> "web.Response":
+        return web.json_response(
+            _openai_error(message, err_type="invalid_request_error", code=code),
+            status=status,
+        )
+
+    def _project_access_error(self, request: "web.Request") -> Optional["web.Response"]:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._project_sync_enabled or not self._api_key:
+            return self._project_request_error("Not found.", 404, "not_found")
+        return None
+
+    @staticmethod
+    def _project_snapshot(conn) -> Dict[str, Any]:
+        from hermes_cli import projects_db as pdb
+
+        return {
+            "object": "hermes.project.snapshot",
+            "revision": pdb.get_sync_revision(conn),
+            "projects": [
+                project.to_dict()
+                for project in pdb.list_projects(conn, include_archived=True)
+            ],
+            "session_assignments": pdb.list_session_assignments(conn),
+        }
+
+    @staticmethod
+    def _project_json_response(
+        payload: Dict[str, Any], *, status: int = 200
+    ) -> "web.Response":
+        response = web.json_response(payload, status=status)
+        response.headers["ETag"] = f'"{int(payload["revision"])}"'
+        response.headers["Cache-Control"] = "private, no-cache"
+        return response
+
+    def _check_project_precondition(
+        self, request: "web.Request", current_revision: int
+    ) -> Optional["web.Response"]:
+        raw = request.headers.get("If-Match", "").strip()
+        if not raw:
+            return self._project_request_error(
+                "If-Match is required for project writes.",
+                428,
+                "precondition_required",
+            )
+        if raw.startswith('W/'):
+            return self._project_request_error(
+                "Weak project revisions are not accepted.", 400, "invalid_revision"
+            )
+        token = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] == '"' else raw
+        if not token.isdigit():
+            return self._project_request_error(
+                "Invalid project revision.", 400, "invalid_revision"
+            )
+        if int(token) != current_revision:
+            response = self._project_request_error(
+                "Project state changed; fetch the latest snapshot and retry.",
+                412,
+                "revision_conflict",
+            )
+            response.headers["ETag"] = f'"{current_revision}"'
+            return response
+        return None
+
+    @staticmethod
+    def _validate_project_body(body: Dict[str, Any], *, creating: bool) -> Optional[str]:
+        portable = {"name", "description", "icon", "color", "pinned"}
+        unsupported = set(body) - portable
+        if unsupported:
+            return "Unsupported project fields: " + ", ".join(sorted(unsupported))
+        if creating and "name" not in body:
+            return "Project name is required."
+        if "name" in body:
+            name = body.get("name")
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
+                return "Project name must be 1-120 characters."
+        if "description" in body:
+            description = body.get("description")
+            if description is not None and (
+                not isinstance(description, str) or len(description) > 4000
+            ):
+                return "Project description must be at most 4000 characters."
+        for key in ("icon", "color"):
+            value = body.get(key)
+            if key in body and value is not None and (
+                not isinstance(value, str) or len(value) > 128
+            ):
+                return f"Project {key} must be at most 128 characters."
+        if "pinned" in body and not isinstance(body.get("pinned"), bool):
+            return "Project pinned must be a boolean."
+        return None
+
+    async def _handle_projects_list(self, request: "web.Request") -> "web.Response":
+        access_err = self._project_access_error(request)
+        if access_err:
+            return access_err
+        from hermes_cli import projects_db as pdb
+
+        try:
+            with pdb.connect_closing() as conn:
+                return self._project_json_response(self._project_snapshot(conn))
+        except Exception:
+            logger.exception("GET /api/projects failed")
+            return web.json_response(_openai_error("Failed to read projects", err_type="server_error"), status=500)
+
+    async def _handle_projects_create(self, request: "web.Request") -> "web.Response":
+        access_err = self._project_access_error(request)
+        if access_err:
+            return access_err
+        body, body_err = await self._read_json_body(request)
+        if body_err:
+            return body_err
+        validation = self._validate_project_body(body, creating=True)
+        if validation:
+            return self._project_request_error(validation, 400, "invalid_project")
+
+        from hermes_cli import projects_db as pdb
+        try:
+            with pdb.connect_closing() as conn:
+                precondition = self._check_project_precondition(
+                    request, pdb.get_sync_revision(conn)
+                )
+                if precondition:
+                    return precondition
+                project_id = pdb.create_project(
+                    conn,
+                    name=body["name"],
+                    description=body.get("description"),
+                    icon=body.get("icon"),
+                    color=body.get("color"),
+                    pinned=body.get("pinned", False),
+                )
+                payload = self._project_snapshot(conn)
+                payload["project"] = pdb.get_project(conn, project_id).to_dict()
+                return self._project_json_response(payload, status=201)
+        except ValueError as exc:
+            return self._project_request_error(str(exc), 400, "invalid_project")
+        except Exception:
+            logger.exception("POST /api/projects failed")
+            return web.json_response(_openai_error("Failed to create project", err_type="server_error"), status=500)
+
+    async def _handle_projects_update(self, request: "web.Request") -> "web.Response":
+        access_err = self._project_access_error(request)
+        if access_err:
+            return access_err
+        body, body_err = await self._read_json_body(request)
+        if body_err:
+            return body_err
+        validation = self._validate_project_body(body, creating=False)
+        if validation:
+            return self._project_request_error(validation, 400, "invalid_project")
+
+        from hermes_cli import projects_db as pdb
+        project_id = request.match_info.get("project_id", "")
+        try:
+            with pdb.connect_closing() as conn:
+                precondition = self._check_project_precondition(
+                    request, pdb.get_sync_revision(conn)
+                )
+                if precondition:
+                    return precondition
+                if pdb.get_project(conn, project_id) is None:
+                    return self._project_request_error("Project not found.", 404, "not_found")
+                pdb.update_project(
+                    conn,
+                    project_id,
+                    name=body.get("name") if "name" in body else None,
+                    description=body.get("description") if "description" in body else None,
+                    icon=body.get("icon") if "icon" in body else None,
+                    color=body.get("color") if "color" in body else None,
+                    pinned=body.get("pinned") if "pinned" in body else None,
+                )
+                payload = self._project_snapshot(conn)
+                payload["project"] = pdb.get_project(conn, project_id).to_dict()
+                return self._project_json_response(payload)
+        except ValueError as exc:
+            return self._project_request_error(str(exc), 400, "invalid_project")
+        except Exception:
+            logger.exception("PATCH /api/projects failed")
+            return web.json_response(_openai_error("Failed to update project", err_type="server_error"), status=500)
+
+    async def _handle_projects_delete(self, request: "web.Request") -> "web.Response":
+        access_err = self._project_access_error(request)
+        if access_err:
+            return access_err
+        from hermes_cli import projects_db as pdb
+        project_id = request.match_info.get("project_id", "")
+        try:
+            with pdb.connect_closing() as conn:
+                precondition = self._check_project_precondition(
+                    request, pdb.get_sync_revision(conn)
+                )
+                if precondition:
+                    return precondition
+                if not pdb.delete_project(conn, project_id):
+                    return self._project_request_error("Project not found.", 404, "not_found")
+                return self._project_json_response(self._project_snapshot(conn))
+        except Exception:
+            logger.exception("DELETE /api/projects failed")
+            return web.json_response(_openai_error("Failed to delete project", err_type="server_error"), status=500)
+
+    async def _handle_projects_assign_session(self, request: "web.Request") -> "web.Response":
+        access_err = self._project_access_error(request)
+        if access_err:
+            return access_err
+        from hermes_cli import projects_db as pdb
+        project_id = request.match_info.get("project_id", "")
+        session_id = request.match_info.get("session_id", "")
+        session_db = self._ensure_session_db()
+        if session_db is None or session_db.get_session(session_id) is None:
+            return self._project_request_error("Session not found.", 404, "not_found")
+        try:
+            with pdb.connect_closing() as conn:
+                precondition = self._check_project_precondition(
+                    request, pdb.get_sync_revision(conn)
+                )
+                if precondition:
+                    return precondition
+                if pdb.get_project(conn, project_id) is None:
+                    return self._project_request_error("Project not found.", 404, "not_found")
+                pdb.assign_session(conn, project_id, session_id)
+                return self._project_json_response(self._project_snapshot(conn))
+        except ValueError as exc:
+            return self._project_request_error(str(exc), 400, "invalid_assignment")
+        except Exception:
+            logger.exception("PUT project session assignment failed")
+            return web.json_response(_openai_error("Failed to assign session", err_type="server_error"), status=500)
+
+    async def _handle_projects_unassign_session(self, request: "web.Request") -> "web.Response":
+        access_err = self._project_access_error(request)
+        if access_err:
+            return access_err
+        from hermes_cli import projects_db as pdb
+        session_id = request.match_info.get("session_id", "")
+        session_db = self._ensure_session_db()
+        if session_db is None or session_db.get_session(session_id) is None:
+            return self._project_request_error("Session not found.", 404, "not_found")
+        try:
+            with pdb.connect_closing() as conn:
+                precondition = self._check_project_precondition(
+                    request, pdb.get_sync_revision(conn)
+                )
+                if precondition:
+                    return precondition
+                pdb.exclude_session(conn, session_id)
+                return self._project_json_response(self._project_snapshot(conn))
+        except ValueError as exc:
+            return self._project_request_error(str(exc), 400, "invalid_assignment")
+        except Exception:
+            logger.exception("DELETE project session assignment failed")
+            return web.json_response(_openai_error("Failed to unassign session", err_type="server_error"), status=500)
 
     async def _handle_profile_context(self, request: "web.Request") -> "web.Response":
         """GET /v1/profile/context — return a fixed read-only profile file set."""
@@ -5166,6 +5420,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/api/projects", self._handle_projects_list)
+            self._app.router.add_post("/api/projects", self._handle_projects_create)
+            self._app.router.add_patch("/api/projects/{project_id}", self._handle_projects_update)
+            self._app.router.add_delete("/api/projects/{project_id}", self._handle_projects_delete)
+            self._app.router.add_put(
+                "/api/projects/{project_id}/sessions/{session_id}",
+                self._handle_projects_assign_session,
+            )
+            self._app.router.add_delete(
+                "/api/projects/{project_id}/sessions/{session_id}",
+                self._handle_projects_unassign_session,
+            )
             self._app.router.add_get("/v1/profile/context", self._handle_profile_context, allow_head=False)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)

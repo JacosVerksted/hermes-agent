@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS projects (
     description   TEXT,
     icon          TEXT,
     color         TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
     board_slug    TEXT,
     primary_path  TEXT,
     created_at    INTEGER NOT NULL,
@@ -103,6 +104,52 @@ CREATE TABLE IF NOT EXISTS project_session_assignments (
 
 CREATE INDEX IF NOT EXISTS idx_project_session_assignments_project
     ON project_session_assignments(project_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_sync_insert
+AFTER INSERT ON projects BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_projects_sync_update
+AFTER UPDATE ON projects BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_projects_sync_delete
+AFTER DELETE ON projects BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_folders_sync_insert
+AFTER INSERT ON project_folders BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_folders_sync_update
+AFTER UPDATE ON project_folders BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_folders_sync_delete
+AFTER DELETE ON project_folders BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_assignments_sync_insert
+AFTER INSERT ON project_session_assignments BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_assignments_sync_update
+AFTER UPDATE ON project_session_assignments BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_assignments_sync_delete
+AFTER DELETE ON project_session_assignments BEGIN
+    INSERT INTO project_meta (key, value) VALUES ('sync_revision', '1')
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
 """
 
 
@@ -211,15 +258,21 @@ def connect_closing(db_path: Optional[Path] = None):
 
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
-_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
+_OPTIONAL_PROJECT_COLUMNS = {
+    "board_slug": "board_slug TEXT",
+    "primary_path": "primary_path TEXT",
+    "icon": "icon TEXT",
+    "color": "color TEXT",
+    "pinned": "pinned INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns introduced after v1 to legacy DBs (safe on every open)."""
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
-    for col in _OPTIONAL_PROJECT_COLUMNS:
+    for col, ddl in _OPTIONAL_PROJECT_COLUMNS.items():
         if col not in cols:
-            _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+            _add_column_if_missing(conn, "projects", col, ddl)
 
 
 def _migrate_session_assignments(conn: sqlite3.Connection) -> None:
@@ -289,6 +342,7 @@ class Project:
     description: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    pinned: bool = False
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
     archived: bool = False
@@ -302,6 +356,7 @@ class Project:
             "description": self.description,
             "icon": self.icon,
             "color": self.color,
+            "pinned": bool(self.pinned),
             "board_slug": self.board_slug,
             "primary_path": self.primary_path,
             "archived": bool(self.archived),
@@ -320,6 +375,7 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         description=row["description"] if "description" in keys else None,
         icon=row["icon"] if "icon" in keys else None,
         color=row["color"] if "color" in keys else None,
+        pinned=bool(row["pinned"]) if "pinned" in keys else False,
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
         archived=bool(row["archived"]) if "archived" in keys else False,
@@ -377,6 +433,7 @@ def create_project(
     description: Optional[str] = None,
     icon: Optional[str] = None,
     color: Optional[str] = None,
+    pinned: bool = False,
     board_slug: Optional[str] = None,
 ) -> str:
     """Create a project and return its id.
@@ -409,9 +466,9 @@ def create_project(
         unique = _unique_slug(conn, slug_candidate)
         conn.execute(
             "INSERT INTO projects "
-            "(id, slug, name, description, icon, color, board_slug, "
+            "(id, slug, name, description, icon, color, pinned, board_slug, "
             " primary_path, created_at, archived) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 pid,
                 unique,
@@ -419,6 +476,7 @@ def create_project(
                 description,
                 icon,
                 color,
+                1 if pinned else 0,
                 normalize_slug(board_slug) if board_slug else None,
                 primary,
                 now,
@@ -469,6 +527,7 @@ def update_project(
     description: Optional[str] = None,
     icon: Optional[str] = None,
     color: Optional[str] = None,
+    pinned: Optional[bool] = None,
     board_slug: Optional[str] = None,
 ) -> bool:
     """Patch top-level project fields. Only provided fields change.
@@ -494,6 +553,9 @@ def update_project(
     if color is not None:
         sets.append("color = ?")
         params.append(color or None)
+    if pinned is not None:
+        sets.append("pinned = ?")
+        params.append(1 if pinned else 0)
     if board_slug is not None:
         sets.append("board_slug = ?")
         params.append(normalize_slug(board_slug) if board_slug.strip() else None)
@@ -725,6 +787,18 @@ def list_session_assignments(conn: sqlite3.Connection) -> dict[str, Optional[str
 
 
 _ACTIVE_META_KEY = "active_id"
+_SYNC_REVISION_META_KEY = "sync_revision"
+
+
+def get_sync_revision(conn: sqlite3.Connection) -> int:
+    """Return the monotonic revision maintained by canonical-table triggers."""
+    row = conn.execute(
+        "SELECT value FROM project_meta WHERE key = ?", (_SYNC_REVISION_META_KEY,)
+    ).fetchone()
+    try:
+        return max(0, int(row["value"])) if row else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def set_active(conn: sqlite3.Connection, project_id: Optional[str]) -> None:
