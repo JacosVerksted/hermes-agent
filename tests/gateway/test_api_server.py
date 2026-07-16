@@ -1156,6 +1156,26 @@ class TestProjectsEndpoint:
         assert response.status == 400
 
     @pytest.mark.asyncio
+    async def test_project_update_rejects_null_description(self, auth_adapter):
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            project_id = pdb.create_project(conn, name="Existing", description="Keep me")
+            revision = pdb.get_sync_revision(conn)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app), headers=self._AUTH) as cli:
+            response = await cli.patch(
+                f"/api/projects/{project_id}",
+                headers={"If-Match": f'"{revision}"'},
+                json={"description": None},
+            )
+            payload = await response.json()
+
+        assert response.status == 400
+        assert payload["error"]["code"] == "invalid_project"
+
+    @pytest.mark.asyncio
     async def test_project_create_requires_idempotency_key(self, auth_adapter):
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app), headers=self._AUTH) as cli:

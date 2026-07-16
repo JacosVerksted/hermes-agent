@@ -1909,10 +1909,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return "Project name must be 1-120 characters."
         if "description" in body:
             description = body.get("description")
-            if description is not None and (
-                not isinstance(description, str) or len(description) > 4000
-            ):
-                return "Project description must be at most 4000 characters."
+            if not isinstance(description, str) or len(description) > 4000:
+                return "Project description must be a string of at most 4000 characters."
         if "pinned" in body and not isinstance(body.get("pinned"), bool):
             return "Project pinned must be a boolean."
         return None
